@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -25,11 +26,11 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')  # ID администратора
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # URL для вебхука (будет создан автоматически)
+ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
+PORT = int(os.environ.get('PORT', 8443))
 
 # Состояния для ConversationHandler
-LOCATION, PHONE, CAR_DETAILS, ACCIDENT_DETAILS, PHOTOS, CONFIRMATION = range(6)
+LOCATION, PHONE, CAR_DETAILS, ACCIDENT_DETAILS, PHOTOS = range(5)
 
 # Клавиатуры
 def main_keyboard():
@@ -40,9 +41,9 @@ def main_keyboard():
         ["📝 Описание ДТП"],
         ["📷 Прикрепить фото"],
         ["✅ Отправить заявку"]
-    ], resize_keyboard=True, one_time_keyboard=False)
+    ], resize_keyboard=True)
 
-# Хранилище данных заявки (в production используйте БД)
+# Хранилище данных заявки
 user_data_store = {}
 
 # Команда /start
@@ -61,7 +62,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "После отправки с вами свяжутся в течение 15 минут."
     )
     
-    # Инициализируем данные пользователя
     user_data_store[user.id] = {
         'user_id': user.id,
         'username': user.username,
@@ -117,16 +117,6 @@ async def handle_car_details(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     text = update.message.text.strip()
     
-    if text == "🚗 Данные автомобиля":
-        await update.message.reply_text(
-            "Пожалуйста, введите данные автомобиля:\n"
-            "• Марка и модель\n"
-            "• Госномер\n"
-            "• VIN (при наличии)",
-            reply_markup=main_keyboard()
-        )
-        return CAR_DETAILS
-    
     if user.id in user_data_store:
         user_data_store[user.id]['car_details'] = text
     
@@ -145,23 +135,12 @@ async def handle_accident_details(update: Update, context: ContextTypes.DEFAULT_
     user = update.effective_user
     text = update.message.text.strip()
     
-    if text == "📝 Описание ДТП":
-        await update.message.reply_text(
-            "Пожалуйста, опишите обстоятельства ДТП:\n"
-            "• Дата и время ДТП\n"
-            "• Обстоятельства происшествия\n"
-            "• Есть ли пострадавшие\n"
-            "• Количество участников",
-            reply_markup=main_keyboard()
-        )
-        return ACCIDENT_DETAILS
-    
     if user.id in user_data_store:
         user_data_store[user.id]['accident_details'] = text
     
     await update.message.reply_text(
         "📝 Описание ДТП сохранено! Теперь прикрепите фотографии (до 5 фото).\n"
-        "Отправьте по одной фотографии или несколько сразу.",
+        "Отправьте фотографии или нажмите '✅ Отправить заявку' для завершения.",
         reply_markup=main_keyboard()
     )
     return PHOTOS
@@ -175,8 +154,6 @@ async def handle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if update.message.photo:
         photo = update.message.photo[-1]
-        
-        # Сохраняем file_id фотографии
         user_data_store[user.id]['photos'].append(photo.file_id)
         
         photo_count = len(user_data_store[user.id]['photos'])
@@ -184,7 +161,7 @@ async def handle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if photo_count < 5:
             await update.message.reply_text(
                 f"📷 Фотография #{photo_count} получена. "
-                f"Можно отправить еще {5-photo_count} или нажмите '✅ Отправить заявку'",
+                f"Можно отправить еще {5-photo_count}.",
                 reply_markup=main_keyboard()
             )
         else:
@@ -196,7 +173,7 @@ async def handle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return PHOTOS
 
-# Подтверждение и отправка заявки
+# Отправка заявки
 async def send_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
@@ -209,7 +186,7 @@ async def send_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = user_data_store[user.id]
     
-    # Проверяем, что все обязательные поля заполнены
+    # Проверяем обязательные поля
     if not all([data.get('phone'), data.get('location'), data.get('car_details'), data.get('accident_details')]):
         missing_fields = []
         if not data.get('phone'): missing_fields.append("номер телефона")
@@ -234,37 +211,26 @@ async def send_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 Описание ДТП:\n{data['accident_details']}\n"
             f"📷 Фотографий: {len(data['photos'])}\n"
             f"🕒 Время заявки: {data['created_at']}\n"
-            f"🆔 ID пользователя: {user.id}\n"
-            f"👤 Username: @{data['username'] if data['username'] else 'не указан'}"
+            f"🆔 ID пользователя: {user.id}"
         )
         
-        # Отправляем сообщение администратору
+        # Отправляем администратору
         if ADMIN_CHAT_ID:
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=admin_message
             )
             
-            # Отправляем фотографии администратору, если они есть
+            # Отправляем фотографии
             if data['photos']:
-                media_group = []
-                for i, photo_id in enumerate(data['photos'][:5]):  # Максимум 5 фото
-                    if i == 0:
-                        media_group.append({
-                            'type': 'photo',
-                            'media': photo_id,
-                            'caption': f"Фото {i+1} от {data['full_name']}"
-                        })
-                    else:
-                        media_group.append({
-                            'type': 'photo',
-                            'media': photo_id
-                        })
-                
-                await context.bot.send_media_group(
-                    chat_id=ADMIN_CHAT_ID,
-                    media=media_group
-                )
+                for photo_id in data['photos'][:5]:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=ADMIN_CHAT_ID,
+                            photo=photo_id
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки фото: {e}")
         
         # Подтверждение пользователю
         await update.message.reply_text(
@@ -275,7 +241,7 @@ async def send_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardMarkup([['/start']], resize_keyboard=True)
         )
         
-        # Очищаем данные пользователя
+        # Очищаем данные
         if user.id in user_data_store:
             del user_data_store[user.id]
             
@@ -302,70 +268,25 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# Команда для админа - просмотр всех заявок
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    
-    # Проверяем, что команду вызвал админ
-    if str(user.id) != ADMIN_CHAT_ID:
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
-        return
-    
-    active_requests = len(user_data_store)
-    
-    await update.message.reply_text(
-        f"📊 Статистика бота:\n"
-        f"• Активных заявок: {active_requests}\n"
-        f"• Всего пользователей в базе: {len(user_data_store)}"
-    )
-
-# Обработка текстовых сообщений (для кнопок меню)
+# Обработка текста (кнопки меню)
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
-    if text == "📍 Отправить местоположение":
-        await update.message.reply_text(
-            "Пожалуйста, нажмите на кнопку '📍 Отправить местоположение' ниже",
-            reply_markup=main_keyboard()
-        )
-        return LOCATION
-    
-    elif text == "📱 Отправить номер":
-        await update.message.reply_text(
-            "Пожалуйста, нажмите на кнопку '📱 Отправить номер' ниже",
-            reply_markup=main_keyboard()
-        )
-        return PHONE
-    
-    elif text == "🚗 Данные автомобиля":
-        await handle_car_details(update, context)
-        
-    elif text == "📝 Описание ДТП":
-        await handle_accident_details(update, context)
-        
-    elif text == "📷 Прикрепить фото":
-        await update.message.reply_text(
-            "Пожалуйста, отправьте фотографии ДТП",
-            reply_markup=main_keyboard()
-        )
-        return PHOTOS
-        
-    elif text == "✅ Отправить заявку":
-        await send_application(update, context)
-        
+    if text == "✅ Отправить заявку":
+        return await send_application(update, context)
+    elif text in ["🚗 Данные автомобиля", "📝 Описание ДТП", "📷 Прикрепить фото"]:
+        # Просто игнорируем повторные нажатия на эти кнопки
+        return await context.application.persistence.get_user_context(update.effective_user.id)
     else:
-        # Если пользователь просто пишет текст в неправильном состоянии
-        current_state = await context.application.persistence.get_user_context(update.effective_user.id)
-        if current_state is None:
-            await start(update, context)
-        else:
-            await update.message.reply_text(
-                "Пожалуйста, используйте кнопки меню для заполнения заявки",
-                reply_markup=main_keyboard()
-            )
+        # Если пользователь пишет текст вне состояний
+        await update.message.reply_text(
+            "Пожалуйста, используйте кнопки меню или начните с /start",
+            reply_markup=main_keyboard()
+        )
+        return ConversationHandler.END
 
 # Основная функция
-def main():
+async def main():
     # Проверяем наличие токена
     if not TOKEN:
         logger.error("Токен бота не найден! Установите переменную окружения TELEGRAM_BOT_TOKEN")
@@ -380,11 +301,11 @@ def main():
         states={
             LOCATION: [
                 MessageHandler(filters.LOCATION, handle_location),
-                MessageHandler(filters.TEXT, handle_text)
+                MessageHandler(filters.TEXT & filters.Regex('^📍'), lambda u, c: u.message.reply_text("Пожалуйста, нажмите кнопку '📍 Отправить местоположение'", reply_markup=main_keyboard()))
             ],
             PHONE: [
                 MessageHandler(filters.CONTACT, handle_contact),
-                MessageHandler(filters.TEXT, handle_text)
+                MessageHandler(filters.TEXT & filters.Regex('^📱'), lambda u, c: u.message.reply_text("Пожалуйста, нажмите кнопку '📱 Отправить номер'", reply_markup=main_keyboard()))
             ],
             CAR_DETAILS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_car_details)
@@ -394,43 +315,47 @@ def main():
             ],
             PHOTOS: [
                 MessageHandler(filters.PHOTO, handle_photos),
-                MessageHandler(filters.TEXT, handle_text)
+                MessageHandler(filters.TEXT & filters.Regex('^✅'), send_application)
             ]
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
             CommandHandler('start', start),
-            MessageHandler(filters.COMMAND, start)
-        ],
-        allow_reentry=True
+            MessageHandler(filters.TEXT & filters.Regex('^✅'), send_application)
+        ]
     )
     
     # Добавляем обработчики
     application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("admin", admin_stats))
     application.add_handler(CommandHandler("cancel", cancel))
     
-    # Запускаем бота
-    port = int(os.environ.get('PORT', 8443))
+    # Запускаем бота с вебхуком на Render
+    webhook_url = f"https://telegram-commissioner-bot.onrender.com/{TOKEN}"
+    logger.info(f"Запуск бота с вебхуком: {webhook_url}")
     
-    # Получаем имя сервиса Render
-    render_service_name = os.getenv('RENDER_SERVICE_NAME', '')
+    await application.initialize()
+    await application.start()
     
-    if render_service_name:
-        # Используем вебхук на Render
-        webhook_url = f"https://{render_service_name}.onrender.com/{TOKEN}"
-        logger.info(f"Запуск с вебхуком: {webhook_url}")
-        
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=TOKEN,
-            webhook_url=webhook_url
-        )
-    else:
-        # Локальный запуск с поллингом
-        logger.info("Запуск в режиме поллинга...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Устанавливаем вебхук
+    await application.bot.set_webhook(url=webhook_url)
+    
+    # Запускаем сервер
+    await application.updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=TOKEN,
+        webhook_url=webhook_url
+    )
+    
+    logger.info("Бот запущен и готов к работе!")
+    
+    # Бесконечный цикл
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Остановка бота...")
+    finally:
+        await application.stop()
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
